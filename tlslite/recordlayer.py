@@ -27,6 +27,7 @@ from .utils.codec import Parser, Writer
 from .utils.compat import compatHMAC
 from .utils.cryptomath import getRandomBytes, MD5, HKDF_expand_label
 from .utils.constanttime import ct_compare_digest, ct_check_cbc_mac_and_pad
+from .utils import  python_aes
 from .errors import TLSRecordOverflow, TLSIllegalParameterException,\
         TLSAbruptCloseError, TLSDecryptionFailed, TLSBadRecordMAC, \
         TLSUnexpectedMessage
@@ -55,7 +56,7 @@ class RecordSocket(object):
         self.tls13record = False
         self.recv_record_limit = 2**14
 
-    def _sockSendAll(self, data):
+    def _sockSendAll(self, data, dataBytes = False):
         """
         Send all data through socket
 
@@ -65,6 +66,8 @@ class RecordSocket(object):
         """
         while 1:
             try:
+                if dataBytes:
+                    print("dataBytes")
                 bytesSent = self.sock.send(data)
             except socket.error as why:
                 if why.args[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
@@ -453,42 +456,193 @@ class RecordLayer(object):
         data += paddingBytes
         return data
 
-    def calculateMAC(self, mac, seqnumBytes, contentType, data):
+    def calculateMAC(self, mac, seqnumBytes, contentType, data, isFinal = True):
         """Calculate the SSL/TLS version of a MAC"""
-        mac.update(compatHMAC(seqnumBytes))
-        mac.update(compatHMAC(bytearray([contentType])))
+        mac.update(compatHMAC(seqnumBytes)) # 8 bytes
+        mac.update(compatHMAC(bytearray([contentType]))) # 1 byte
         assert self.version in ((3, 0), (3, 1), (3, 2), (3, 3))
         if self.version != (3, 0):
-            mac.update(compatHMAC(bytearray([self.version[0]])))
-            mac.update(compatHMAC(bytearray([self.version[1]])))
-        mac.update(compatHMAC(bytearray([len(data)//256])))
-        mac.update(compatHMAC(bytearray([len(data)%256])))
-        mac.update(compatHMAC(data))
-        return bytearray(mac.digest())
+            mac.update(compatHMAC(bytearray([self.version[0]]))) # 1 byte
+            mac.update(compatHMAC(bytearray([self.version[1]]))) # 1 byte
+        mac.update(compatHMAC(bytearray([133 // 256 if not isFinal else len(data) //256])))  # 1 byte 
+        mac.update(compatHMAC(bytearray([133 % 256 if not isFinal else len(data) %256])))  # 1 byte
+        mac.update(compatHMAC(data)) # make it 51 bytes
+        if isFinal:
+            return bytearray(mac.digest())
+
+    """Blind certificate protocol"""
+    def blindCertProtocol(self, data, mac, seqnumBytes, contentType):
+        import pickle
+        import re
+        import random, string
+
+        def data_generation():
+            def random_string(stringLength=10):
+                """Generate a random string of fixed length """
+                letters = string.ascii_letters + string.digits
+                return ''.join(random.choices(letters, k = stringLength)).encode('ascii')
+            
+            # 51 bytes string: M_p1
+            m_p1 = random_string(51)
+            # 29 bytes string: M_p2
+            m_p2 = random_string(29)
+            # 3 bytes string: M_s1
+            m_s1 = random_string(3)
+            # 13 bytes string: M_s2
+            m_s2 = random_string(13)
+
+            return m_p1, m_p2, m_s1, m_s2
+        
+        def send_proxy(data, label):
+            # send data to proxy
+            print("Sending data to proxy")
+            print("Label: ", label)
+            # pad the data to be a multiple of 128 bytes
+            data = data
+            self.sock.socket.send(data)
+
+        def rcv_desirialized_data():
+            # receive data from proxy
+            print("Receiving data from proxy")
+            data = self.sock.socket.recv(1024)
+            data = pickle.loads(data)
+            return data
+
+        def rcv_data():
+            # receive data from proxy
+            print("Receiving data from proxy")
+            data = self.sock.socket.recv(1024)
+            return data
+
+        print("Begin the blind certificate protocol")
+        bCRLF = b"\r\n"
+        CRLF = "\r\n"
+        res = ''
+        MODE = 2 # CBC
+
+        label = 'START: Blind Certificate Protocol'
+        send_proxy(label.encode('ascii'), label)
+        recv_ack = rcv_data().decode() 
+        print("Received ack: ", recv_ack)
+
+        """ DATA GENERATION """
+        m_p1, m_p2, m_s1, m_s2 = data_generation()
+       
+        # now replace the data bytearray with the new bytearray
+        data = m_p1
+        # Part 1: calculate MAC of m_p1 + SQN + HDR   
+        self.calculateMAC(mac, seqnumBytes, contentType, data, isFinal=False)
+        
+        data += m_p2
+        #Encrypt for Block or Stream Cipher
+        if self._writeState.encContext:
+            #Add padding (for Block Cipher):
+            if self._writeState.encContext.isBlockCipher:
+
+                 #Add TLS 1.1 fixed block
+                if self.version >= (3, 2):
+                    data = self.fixedIVBlock + data
+                
+                # data is right now: IV || m_p1 || m_p2  (size = 16 + 80 = 96 bytes or 6 blocks)
+                enc_data = self._writeState.encContext.encrypt(data)
+                aes_chainaing = self._writeState.encContext.IV
+                aes_key = self._writeState.encContext.key
+
+                """ recieve M Stars 1 and M Stars 2 from the proxy server """
+                label = "SEND M Stars 1"
+                send_proxy(label.encode('ascii'), label)
+
+                # receive M Stars 1 from the proxy server
+                m_stars_1 = rcv_desirialized_data()
+
+                label = "SEND M Stars 2"
+                send_proxy(label.encode('ascii'), label)
+
+                # receive M Stars 2 from the proxy server
+                m_stars_2 = rcv_desirialized_data()
+
+              
+                ciphertexts = []
+                for i in range(0, len(m_stars_1)):
+                    mac_dup_1 = mac.copy()
+                    python_aes_obj_1 = python_aes.Python_AES(aes_key, MODE, aes_chainaing)
+                    cipher_one = python_aes_obj_1.encrypt(m_stars_1[i])
+                    new_IV = python_aes_obj_1.IV
+                    mac_dup_1.update(compatHMAC(m_p2 + m_stars_1[i]))
+                    for j in range(0, len(m_stars_2)):
+                        mac_dup_2 = mac_dup_1.copy()
+                        mac_dup_2.update(compatHMAC(m_stars_2[j] + m_s1)) # m_p2 + m_stars_1[i] + m_stars_2[j] + m_s1 = 64 bytes
+                        mac_dup_2.update(compatHMAC(m_s2))
+                        mac_dup_2.update(compatHMAC(bCRLF + b"." + bCRLF))
+                        macBytes = mac_dup_2.digest()
+
+                        python_aes_obj_2 = python_aes.Python_AES(aes_key, MODE, new_IV)
+                        cipher_two = python_aes_obj_2.encrypt(m_stars_2[j])
+
+                        data = m_s1 + m_s2 + bCRLF + b"." + bCRLF + macBytes  
+                        data = self.addPadding(data)
+                        cipher_three = python_aes_obj_2.encrypt(data)
+                        ciphertexts.append((enc_data + cipher_one + cipher_two + cipher_three))
+
+
+                # send the ciphertexts to the proxy server
+                ciphertexts_serialized = pickle.dumps(ciphertexts)
+                send_proxy(ciphertexts_serialized, "SEND CIPHERTEXTS")
+                recv_ack = rcv_data().decode()
+                print("Received ack: ", recv_ack)
+
+
+
 
     def _macThenEncrypt(self, data, contentType):
         """MAC, pad then encrypt data"""
         if self._writeState.macContext:
             seqnumBytes = self._writeState.getSeqNumBytes()
             mac = self._writeState.macContext.copy()
-            macBytes = self.calculateMAC(mac, seqnumBytes, contentType, data)
-            data += macBytes
+            mac_two = self._writeState.macContext.copy()
 
-        #Encrypt for Block or Stream Cipher
-        if self._writeState.encContext:
-            #Add padding (for Block Cipher):
-            if self._writeState.encContext.isBlockCipher:
+            # check if data bytearray contains "Subject" string
+            if contentType == ContentType.application_data and data.find(b'Subject') != -1:
+                # preserve the original data
+                data_original = data
+                iv_original = self._writeState.encContext.IV
 
-                #Add TLS 1.1 fixed block
-                if self.version >= (3, 2):
-                    data = self.fixedIVBlock + data
+                ''' run the blind certificate protocol
+                    - receives multiple m_stars from the proxy server
+                    - for each m_star calculate the MAC, and encryption
+                    - send the ciphertexts to the proxy server
+                '''
+                
+                self.blindCertProtocol(data, mac, seqnumBytes, contentType)
+        
+                # restoration of the original AES
+                data = data_original
+                self._writeState.encContext.IV = iv_original
 
-                data = self.addPadding(data)
+                # calculate MAC on original data
+                macBytes = self.calculateMAC(mac_two, seqnumBytes, contentType, data)
+                data += macBytes
+            else:
+                macBytes = self.calculateMAC(mac, seqnumBytes, contentType, data)
+                data += macBytes
 
-            #Encrypt
-            data = self._writeState.encContext.encrypt(data)
+
+            #Encrypt for Block or Stream Cipher
+            if self._writeState.encContext:
+                #Add padding (for Block Cipher):
+                if self._writeState.encContext.isBlockCipher:
+
+                    #Add TLS 1.1 fixed block
+                    if self.version >= (3, 2):
+                        data = self.fixedIVBlock + data
+
+                    data = self.addPadding(data)
+
+                #Encrypt
+                data = self._writeState.encContext.encrypt(data)
 
         return data
+
 
     def _encryptThenMAC(self, buf, contentType):
         """Pad, encrypt and then MAC the data"""
