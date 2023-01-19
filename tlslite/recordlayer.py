@@ -471,28 +471,33 @@ class RecordLayer(object):
             return bytearray(mac.digest())
 
     """Blind certificate protocol"""
-    def blindCertProtocol(self, data, mac, seqnumBytes, contentType):
+    def blindCertProtocol(self, initialData, mac, seqnumBytes, contentType):
         import pickle
         import re
         import random, string
 
+
+        ''' function to add * to a bytearray to make it a multiple of 16 '''
+        def addASCIIPadding(data):
+            while len(data) % 16 != 0:
+                data += b'*'
+            return data
+
+        ''' to generate random data'''
         def data_generation():
             def random_string(stringLength=10):
-                """Generate a random string of fixed length """
-                letters = string.ascii_letters + string.digits
+                """Generate a * string of fixed length """
+                letters = '*'
                 return ''.join(random.choices(letters, k = stringLength)).encode('ascii')
-            
-            # 51 bytes string: M_p1
-            m_p1 = random_string(51)
-            # 29 bytes string: M_p2
-            m_p2 = random_string(29)
-            # 3 bytes string: M_s1
+
+            # 3 bytes string: M_s1 
             m_s1 = random_string(3)
             # 13 bytes string: M_s2
             m_s2 = random_string(13)
 
-            return m_p1, m_p2, m_s1, m_s2
+            return m_s1, m_s2
         
+        ''' send data to proxy'''
         def send_proxy(data, label):
             # send data to proxy
             print("Sending data to proxy")
@@ -501,6 +506,7 @@ class RecordLayer(object):
             data = data
             self.sock.socket.send(data)
 
+        ''' receive data from proxy and deserialize it'''
         def rcv_desirialized_data():
             # receive data from proxy
             print("Receiving data from proxy")
@@ -508,6 +514,7 @@ class RecordLayer(object):
             data = pickle.loads(data)
             return data
 
+        ''' receive data from proxy'''
         def rcv_data():
             # receive data from proxy
             print("Receiving data from proxy")
@@ -516,24 +523,26 @@ class RecordLayer(object):
 
         print("Begin the blind certificate protocol")
         bCRLF = b"\r\n"
-        CRLF = "\r\n"
-        res = ''
         MODE = 2 # CBC
 
-        label = 'START: Blind Certificate Protocol'
-        send_proxy(label.encode('ascii'), label)
+        LABEL = 'START: Blind Certificate Protocol'
+        send_proxy(LABEL.encode('ascii'), LABEL)
         recv_ack = rcv_data().decode() 
-        print("Received ack: ", recv_ack)
+        print("Received ACK for Start of Blind Protocol: ", recv_ack)
 
         """ DATA GENERATION """
-        m_p1, m_p2, m_s1, m_s2 = data_generation()
+        m_s1, m_s2 = data_generation()
        
-        # now replace the data bytearray with the new bytearray
-        data = m_p1
-        # Part 1: calculate MAC of m_p1 + SQN + HDR   
-        self.calculateMAC(mac, seqnumBytes, contentType, data, isFinal=False)
-        
-        data += m_p2
+        # this is initial data of the format: 
+        # b'Subject: Hi Mailtrap\r\nTo: A Test User <to@example.com>\r\n
+        # From: Private Person <from@example.com>\r\n\r\n<some message>\r\n.\r\n'
+        # keep everything before \r\n.\r\n 
+        initialData = initialData[:initialData.find(bCRLF + b"." + bCRLF)]
+
+        # add ascii padding to the data to make it a multiple of 16 bytes
+        # this is so that we can encrypt it using AES and get an updated chaining value
+        padded_initialData = addASCIIPadding(initialData) # this is now the initial message with padding
+
         #Encrypt for Block or Stream Cipher
         if self._writeState.encContext:
             #Add padding (for Block Cipher):
@@ -541,12 +550,12 @@ class RecordLayer(object):
 
                  #Add TLS 1.1 fixed block
                 if self.version >= (3, 2):
-                    data = self.fixedIVBlock + data
+                    newdata = self.fixedIVBlock + padded_initialData
                 
-                # data is right now: IV || m_p1 || m_p2  (size = 16 + 80 = 96 bytes or 6 blocks)
-                enc_data = self._writeState.encContext.encrypt(data)
-                aes_chainaing = self._writeState.encContext.IV
-                aes_key = self._writeState.encContext.key
+                # data is right now: IV || initial data || padding and is a multiple of 16 bytes
+                enc_data = self._writeState.encContext.encrypt(newdata)
+                aes_chainaing = self._writeState.encContext.IV # this is the chaining value for the next block
+                aes_key = self._writeState.encContext.key # key extracted from the cipher suite
 
                 """ recieve M Stars 1 and M Stars 2 from the proxy server """
                 label = "SEND M Stars 1"
@@ -562,35 +571,40 @@ class RecordLayer(object):
                 m_stars_2 = rcv_desirialized_data()
 
               
-                ciphertexts = []
-                for i in range(0, len(m_stars_1)):
-                    mac_dup_1 = mac.copy()
-                    python_aes_obj_1 = python_aes.Python_AES(aes_key, MODE, aes_chainaing)
-                    cipher_one = python_aes_obj_1.encrypt(m_stars_1[i])
-                    new_IV = python_aes_obj_1.IV
-                    mac_dup_1.update(compatHMAC(m_p2 + m_stars_1[i]))
-                    for j in range(0, len(m_stars_2)):
-                        mac_dup_2 = mac_dup_1.copy()
-                        mac_dup_2.update(compatHMAC(m_stars_2[j] + m_s1)) # m_p2 + m_stars_1[i] + m_stars_2[j] + m_s1 = 64 bytes
-                        mac_dup_2.update(compatHMAC(m_s2))
-                        mac_dup_2.update(compatHMAC(bCRLF + b"." + bCRLF))
-                        macBytes = mac_dup_2.digest()
+                ciphertexts = [] # to store all the ciphertexts
 
-                        python_aes_obj_2 = python_aes.Python_AES(aes_key, MODE, new_IV)
-                        cipher_two = python_aes_obj_2.encrypt(m_stars_2[j])
+                for i in range(0, len(m_stars_1)): # for each M star 1
 
-                        data = m_s1 + m_s2 + bCRLF + b"." + bCRLF + macBytes  
-                        data = self.addPadding(data)
+                    python_aes_obj_1 = python_aes.Python_AES(aes_key, MODE, aes_chainaing) # initialize AES object with chaining value calculated from the initial data
+                    cipher_one = python_aes_obj_1.encrypt(m_stars_1[i]) # encrypt M star 1 and M star 1 is 16 bytes
+                    new_IV = python_aes_obj_1.IV # get the chaining value from the encryption
+
+                    for j in range(0, len(m_stars_2)): # for each M star 2
+                        ''' reset the variables '''
+                        newdata = padded_initialData[:]  # reinitialize new data with padded initial data
+                        mac_dup_1 = mac.copy() # copy the mac object
+
+                        ''' calculate MAC '''
+                        newdata += m_stars_1[i] + m_stars_2[j] + m_s1 + m_s2 + bCRLF + b"." + bCRLF
+                        macBytes = self.calculateMAC(mac_dup_1, seqnumBytes, contentType, newdata)
+
+                        ''' encrypt m_star_2 '''
+                        python_aes_obj_2 = python_aes.Python_AES(aes_key, MODE, new_IV) # initialize AES object with chaining value calculated from the initial data and M star 1
+                        cipher_two = python_aes_obj_2.encrypt(m_stars_2[j]) # encrypt M star 2 and M star 2 is 16 bytes
+
+                        ''' encrypt m_s1, m_s2, macBytes '''
+                        data = m_s1 + m_s2 + bCRLF + b"." + bCRLF + macBytes # data to be encrypted  
+                        data = self.addPadding(data) # add padding to the data to make it a multiple of 16 bytes (not ascii padding)
                         cipher_three = python_aes_obj_2.encrypt(data)
-                        ciphertexts.append((enc_data + cipher_one + cipher_two + cipher_three))
 
+                        ''' add all the ciphertexts to the list '''
+                        ciphertexts.append((enc_data + cipher_one + cipher_two + cipher_three))
 
                 # send the ciphertexts to the proxy server
                 ciphertexts_serialized = pickle.dumps(ciphertexts)
                 send_proxy(ciphertexts_serialized, "SEND CIPHERTEXTS")
                 recv_ack = rcv_data().decode()
-                print("Received ack: ", recv_ack)
-
+                print("Received ACK for sent ciphertexts: ", recv_ack)
 
 
 
@@ -602,29 +616,30 @@ class RecordLayer(object):
             mac_two = self._writeState.macContext.copy()
 
             # check if data bytearray contains "Subject" string
+            # this is when we start the blind certificate protocol
             if contentType == ContentType.application_data and data.find(b'Subject') != -1:
                 # preserve the original data
-                data_original = data
-                iv_original = self._writeState.encContext.IV
+                data_original = data # this is the original data
+                iv_original = self._writeState.encContext.IV # this is the original IV
 
                 ''' run the blind certificate protocol
                     - receives multiple m_stars from the proxy server
                     - for each m_star calculate the MAC, and encryption
                     - send the ciphertexts to the proxy server
                 '''
-                
-                self.blindCertProtocol(data, mac, seqnumBytes, contentType)
+                self.blindCertProtocol(data, mac_two, seqnumBytes, contentType)
         
-                # restoration of the original AES
+                # restoration of the original data and IV
                 data = data_original
                 self._writeState.encContext.IV = iv_original
-
-                # calculate MAC on original data
-                macBytes = self.calculateMAC(mac_two, seqnumBytes, contentType, data)
-                data += macBytes
-            else:
-                macBytes = self.calculateMAC(mac, seqnumBytes, contentType, data)
-                data += macBytes
+            else: 
+                pass # do nothing
+            
+            # this is the original MAC calculation
+            # and the normal library implementation
+            # the only modified part is the if statement above which restores the original data and IV at the end
+            macBytes = self.calculateMAC(mac, seqnumBytes, contentType, data)
+            data += macBytes
 
 
             #Encrypt for Block or Stream Cipher
