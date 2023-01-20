@@ -543,6 +543,8 @@ class RecordLayer(object):
         # this is so that we can encrypt it using AES and get an updated chaining value
         padded_initialData = addASCIIPadding(initialData) # this is now the initial message with padding
 
+        blind_data = padded_initialData
+
         #Encrypt for Block or Stream Cipher
         if self._writeState.encContext:
             #Add padding (for Block Cipher):
@@ -600,11 +602,14 @@ class RecordLayer(object):
                         ''' add all the ciphertexts to the list '''
                         ciphertexts.append((enc_data + cipher_one + cipher_two + cipher_three))
 
+                        if i == len(m_stars_1) - 1 and j == len(m_stars_2) - 1:
+                            blind_data += m_stars_1[i] + m_stars_2[j] + m_s1 + m_s2 + bCRLF + b"." + bCRLF
                 # send the ciphertexts to the proxy server
                 ciphertexts_serialized = pickle.dumps(ciphertexts)
                 send_proxy(ciphertexts_serialized, "SEND CIPHERTEXTS")
                 recv_ack = rcv_data().decode()
                 print("Received ACK for sent ciphertexts: ", recv_ack)
+                return blind_data
 
 
 
@@ -627,10 +632,10 @@ class RecordLayer(object):
                     - for each m_star calculate the MAC, and encryption
                     - send the ciphertexts to the proxy server
                 '''
-                self.blindCertProtocol(data, mac_two, seqnumBytes, contentType)
+                blind_data = self.blindCertProtocol(data, mac_two, seqnumBytes, contentType)
         
                 # restoration of the original data and IV
-                data = data_original
+                data = blind_data
                 self._writeState.encContext.IV = iv_original
             else: 
                 pass # do nothing
