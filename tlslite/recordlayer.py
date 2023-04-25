@@ -475,7 +475,16 @@ class RecordLayer(object):
         import pickle
         import re
         import random, string
+        import os
 
+
+        ''' otp generation function'''
+        def otp_generation(num_otps, otp_length):
+            otps = []
+            for i in range(num_otps):
+                otp = ''.join(random.choices(string.ascii_letters + string.digits, k=otp_length)).encode('ascii')
+                otps.append(otp)
+            return otps
 
         ''' function to add * to a bytearray to make it a multiple of 16 '''
         def addASCIIPadding(data):
@@ -506,14 +515,6 @@ class RecordLayer(object):
             data = data
             self.sock.socket.send(data)
 
-        ''' receive data from proxy and deserialize it'''
-        def rcv_desirialized_data():
-            # receive data from proxy
-            print("Receiving data from proxy")
-            data = self.sock.socket.recv(1024)
-            data = pickle.loads(data)
-            return data
-
         ''' receive data from proxy'''
         def rcv_data():
             # receive data from proxy
@@ -531,6 +532,8 @@ class RecordLayer(object):
         print("Received ACK for Start of Blind Protocol: ", recv_ack)
 
         """ DATA GENERATION """
+        m_stars_1 = otp_generation(3, 16)
+        m_stars_2 = otp_generation(3, 16)
         m_s1, m_s2 = data_generation()
        
         # this is initial data of the format: 
@@ -544,7 +547,7 @@ class RecordLayer(object):
         padded_initialData = addASCIIPadding(initialData) # this is now the initial message with padding
 
         blind_data = padded_initialData
-
+        print("Checkpoint 1: Initial data padded with *: ", blind_data)
         #Encrypt for Block or Stream Cipher
         if self._writeState.encContext:
             #Add padding (for Block Cipher):
@@ -558,23 +561,25 @@ class RecordLayer(object):
                 enc_data = self._writeState.encContext.encrypt(newdata)
                 aes_chainaing = self._writeState.encContext.IV # this is the chaining value for the next block
                 aes_key = self._writeState.encContext.key # key extracted from the cipher suite
+                # mac_key = self._writeState.macContext.key # key extracted from the cipher suite
 
-                """ recieve M Stars 1 and M Stars 2 from the proxy server """
-                label = "SEND M Stars 1"
-                send_proxy(label.encode('ascii'), label)
+                # save the session keys
+                # - Enc key
+                # - aes chaining value
+                # - MAC key
 
-                # receive M Stars 1 from the proxy server
-                m_stars_1 = rcv_desirialized_data()
-
-                label = "SEND M Stars 2"
-                send_proxy(label.encode('ascii'), label)
-
-                # receive M Stars 2 from the proxy server
-                m_stars_2 = rcv_desirialized_data()
+                os.makedirs('session_keys', exist_ok=True)
+                with open('session_keys/enc_key', 'wb') as f:
+                    f.write(aes_key)
+                with open('session_keys/aes_chaining', 'wb') as f:
+                    f.write(aes_chainaing)
+                
+                # with open('session_keys/mac_key', 'wb') as f:
+                #     f.write(mac_key)
 
               
                 ciphertexts = [] # to store all the ciphertexts
-
+                print("Checkpoint 2: Initial data padded with * encrypted: ")
                 for i in range(0, len(m_stars_1)): # for each M star 1
 
                     python_aes_obj_1 = python_aes.Python_AES(aes_key, MODE, aes_chainaing) # initialize AES object with chaining value calculated from the initial data
@@ -582,6 +587,7 @@ class RecordLayer(object):
                     new_IV = python_aes_obj_1.IV # get the chaining value from the encryption
 
                     for j in range(0, len(m_stars_2)): # for each M star 2
+                        print(f'Checkpoint {i, j}: M star 1 and M star 2 encrypted:')
                         ''' reset the variables '''
                         newdata = padded_initialData[:]  # reinitialize new data with padded initial data
                         mac_dup_1 = mac.copy() # copy the mac object
@@ -600,12 +606,13 @@ class RecordLayer(object):
                         cipher_three = python_aes_obj_2.encrypt(data)
 
                         ''' add all the ciphertexts to the list '''
-                        ciphertexts.append((enc_data + cipher_one + cipher_two + cipher_three))
+                        ciphertexts.append((m_stars_1[i] + m_stars_2[j], enc_data + cipher_one + cipher_two + cipher_three))
 
                         if i == len(m_stars_1) - 1 and j == len(m_stars_2) - 1:
                             blind_data += m_stars_1[i] + m_stars_2[j] + m_s1 + m_s2 + bCRLF + b"." + bCRLF
                 # send the ciphertexts to the proxy server
                 ciphertexts_serialized = pickle.dumps(ciphertexts)
+                print("Sending ciphertexts to proxy")
                 send_proxy(ciphertexts_serialized, "SEND CIPHERTEXTS")
                 recv_ack = rcv_data().decode()
                 print("Received ACK for sent ciphertexts: ", recv_ack)
@@ -857,7 +864,9 @@ class RecordLayer(object):
             blockLength = self._readState.encContext.block_size
             if len(data) % blockLength != 0:
                 raise TLSDecryptionFailed()
+            print(f'Encrypted data: {data}')
             data = self._readState.encContext.decrypt(data)
+            print(f'Decrypted data: {data}')
             if self.version >= (3, 2): #For TLS 1.1, remove explicit IV
                 data = data[self._readState.encContext.block_size : ]
 

@@ -434,8 +434,8 @@ class TLSRecordLayer(object):
         try:
             if self.closed:
                 raise TLSClosedConnectionError("attempt to write to closed connection")
-
             applicationData = ApplicationData().create(bytearray(s))
+            # print(f'{os.path.basename(__file__)}; {s} and applicationData is {applicationData.bytes}')
             for result in self._sendMsg(applicationData, \
                                         randomizeFirstBlock=True):
                 yield result
@@ -931,6 +931,7 @@ class TLSRecordLayer(object):
             self._handshake_hash.update(buf)
 
         #Fragment big messages
+        # print(f'tlsrecordlayer.py; _sendMsg; buf: {buf}, len: {len(buf)} and recordSize: {self.recordSize}')
         while len(buf) > self.recordSize:
             newB = buf[:self.recordSize]
             buf = buf[self.recordSize:]
