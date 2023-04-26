@@ -56,6 +56,9 @@ class RecordSocket(object):
         self.tls13record = False
         self.recv_record_limit = 2**14
 
+        # custom code:
+        self.drop_mode = False
+
     def _sockSendAll(self, data, dataBytes = False):
         """
         Send all data through socket
@@ -101,6 +104,7 @@ class RecordSocket(object):
                                             len(data))
 
         data = header.write() + data
+        print(f'Length of encrypted message {len(data)}')
 
         for result in self._sockSendAll(data):
             yield result
@@ -710,6 +714,9 @@ class RecordLayer(object):
     def _encryptThenSeal(self, buf, contentType):
         """Encrypt with AEAD cipher"""
         #Assemble the authenticated data.
+        # if b'Subject' in buf:
+        #     print("Subject found in buf")
+        print("buf before seal: ", len(buf))
         seqNumBytes = self._writeState.getSeqNumBytes()
         if not self._is_tls13_plus():
             authData = seqNumBytes + bytearray([contentType,
@@ -730,6 +737,8 @@ class RecordLayer(object):
         assert len(nonce) == self._writeState.encContext.nonceLength
 
         buf = self._writeState.encContext.seal(nonce, buf, authData)
+
+        print("buf after seal: ", len(buf))
 
         #AES-GCM, has an explicit variable nonce.
         if "aes" in self._writeState.encContext.name and \
@@ -799,6 +808,7 @@ class RecordLayer(object):
             pass
         elif self._writeState.encContext and \
                 self._writeState.encContext.isAEAD:
+            print("AEAD encryption")
             data = self._encryptThenSeal(data, contentType)
         elif self._writeState.encryptThenMAC:
             data = self._encryptThenMAC(data, contentType)
@@ -806,7 +816,6 @@ class RecordLayer(object):
             data = self._macThenEncrypt(data, contentType)
 
         encryptedMessage = Message(contentType, data)
-
         for result in self._recordSocket.send(encryptedMessage, padding):
             yield result
 
