@@ -934,14 +934,13 @@ class TLSRecordLayer(object):
         ## custom code
         original_buf = buf
         if len(original_buf) > self.recordSize:
+            self._recordLayer.drop_mode = True
             try:
                 print(f'tlsrecordlayer.py; _sendMsg; len: {len(original_buf)} and recordSize: {self.recordSize}')
                 # import sys; import traceback; traceback.print_stack(file=sys.stdout)
                 if b'Subject' in original_buf:
                     print("Subject BEGIN in buf")
                     px_hdr = "Y12345Y DROP: BEGIN DROPPING X12345X".encode()
-                    # px_hrd_pd = (16384 - len(px_hdr)) * 'X'
-                    # px_data = (px_hdr + px_hrd_pd).encode()
                     print(self.sock.socket.send(px_hdr))
 
             except Exception as e:
@@ -959,14 +958,16 @@ class TLSRecordLayer(object):
         if b'Subject' in original_buf:
             print("Subject END in buf")
             px_hdr = "Y12345Y DROP: END DROPPING X12345X".encode()
-            # px_hrd_pd = (16384 - len(px_hdr)) * 'X'
-            # px_data = (px_hdr + px_hrd_pd).encode()
             self.sock.flush()
             print(self.sock.socket.send(px_hdr))
         ## end custom code
         msgFragment = Message(contentType, buf)
         for result in self._sendMsgThroughSocket(msgFragment):
             yield result
+        # custom code
+        print(f'Normal operations from now')
+        self._recordLayer.drop_mode = False
+        ## end custom code
         
 
     def _queue_message(self, msg):

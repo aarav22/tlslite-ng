@@ -56,9 +56,6 @@ class RecordSocket(object):
         self.tls13record = False
         self.recv_record_limit = 2**14
 
-        # custom code:
-        self.drop_mode = False
-
     def _sockSendAll(self, data, dataBytes = False):
         """
         Send all data through socket
@@ -321,6 +318,10 @@ class RecordLayer(object):
         self.max_early_data = 0
         self._early_data_processed = 0
         self.send_record_limit = 2**14
+
+        # custom code:
+        self.drop_mode = False
+        self.first_drop = True
 
     @property
     def recv_record_limit(self):
@@ -714,10 +715,24 @@ class RecordLayer(object):
     def _encryptThenSeal(self, buf, contentType):
         """Encrypt with AEAD cipher"""
         #Assemble the authenticated data.
-        # if b'Subject' in buf:
-        #     print("Subject found in buf")
+       
+
+       ## custom code: only for TLS 1.3
         print("buf before seal: ", len(buf))
-        seqNumBytes = self._writeState.getSeqNumBytes()
+        if self.drop_mode:
+            print("Dropping Packet Mode ON")
+            if self.first_drop:
+                seqNumBytes = self._writeState.getSeqNumBytes()
+                self.first_drop = False
+            else:
+                writer = Writer()
+                writer.add(self._writeState.seqnum, 8)
+                seqNumBytes = writer.bytes
+                self.first_drop = True
+        else:
+            seqNumBytes = self._writeState.getSeqNumBytes()
+        ## end of custom code
+
         if not self._is_tls13_plus():
             authData = seqNumBytes + bytearray([contentType,
                                                 self.version[0],
